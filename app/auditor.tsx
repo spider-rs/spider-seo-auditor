@@ -3,6 +3,11 @@
 import { useState } from "react";
 import SearchBar from "./searchbar";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import { useToast } from "@/components/ui/use-toast";
 
 interface SEOCheck {
   name: string;
@@ -20,7 +25,6 @@ function auditPage(url: string, html: string): PageAudit {
   const checks: SEOCheck[] = [];
   let score = 100;
 
-  // Title check
   const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
   if (!titleMatch) {
     checks.push({ name: "Title", status: "fail", message: "Missing title tag" });
@@ -35,7 +39,6 @@ function auditPage(url: string, html: string): PageAudit {
     }
   }
 
-  // Meta description
   const descMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["']/i);
   if (!descMatch) {
     checks.push({ name: "Meta Description", status: "fail", message: "Missing meta description" });
@@ -50,7 +53,6 @@ function auditPage(url: string, html: string): PageAudit {
     }
   }
 
-  // H1 count
   const h1Count = (html.match(/<h1[\s>]/gi) || []).length;
   if (h1Count === 0) {
     checks.push({ name: "H1", status: "fail", message: "No H1 tag found" });
@@ -62,7 +64,6 @@ function auditPage(url: string, html: string): PageAudit {
     checks.push({ name: "H1", status: "pass", message: "Single H1 tag found" });
   }
 
-  // Images without alt
   const imgCount = (html.match(/<img[\s]/gi) || []).length;
   const noAlt = (html.match(/<img(?![^>]*alt=)[^>]*>/gi) || []).length;
   if (noAlt > 0) {
@@ -72,7 +73,6 @@ function auditPage(url: string, html: string): PageAudit {
     checks.push({ name: "Image Alt", status: "pass", message: `All ${imgCount} images have alt text` });
   }
 
-  // OG tags
   const hasOgTitle = /<meta[^>]*property=["']og:title["']/i.test(html);
   const hasOgDesc = /<meta[^>]*property=["']og:description["']/i.test(html);
   if (!hasOgTitle || !hasOgDesc) {
@@ -85,58 +85,372 @@ function auditPage(url: string, html: string): PageAudit {
   return { url, score: Math.max(0, score), checks };
 }
 
+type StatusFilter = "all" | "fail" | "warn" | "pass";
+type SortKey = "score" | "url" | "issues";
+type SortDir = "asc" | "desc";
+type ExportFormat = "json" | "csv" | "markdown";
+
+function scoreColor(score: number): string {
+  if (score >= 80) return "text-green-400";
+  if (score >= 50) return "text-yellow-400";
+  return "text-red-400";
+}
+
+function scoreBorder(score: number): string {
+  if (score >= 80) return "border-green-500";
+  if (score >= 50) return "border-yellow-500";
+  return "border-red-500";
+}
+
+function scoreBg(score: number): string {
+  if (score >= 80) return "bg-green-500/10 border-green-500/20";
+  if (score >= 50) return "bg-yellow-500/10 border-yellow-500/20";
+  return "bg-red-500/10 border-red-500/20";
+}
+
+function downloadBlob(content: string, filename: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportAudits(audits: PageAudit[], format: ExportFormat) {
+  const ts = new Date().toISOString().slice(0, 10);
+  const avg = audits.length ? Math.round(audits.reduce((s, a) => s + a.score, 0) / audits.length) : 0;
+
+  if (format === "json") {
+    downloadBlob(JSON.stringify({ date: ts, averageScore: avg, pages: audits }, null, 2), `seo-audit-${ts}.json`, "application/json");
+  } else if (format === "csv") {
+    const rows = [["URL", "Score", "Check", "Status", "Message"]];
+    for (const a of audits) {
+      if (a.checks.length === 0) {
+        rows.push([a.url, String(a.score), "", "", "No checks"]);
+      } else {
+        for (const c of a.checks) {
+          rows.push([a.url, String(a.score), c.name, c.status, c.message]);
+        }
+      }
+    }
+    const csv = rows.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(",")).join("\n");
+    downloadBlob(csv, `seo-audit-${ts}.csv`, "text/csv");
+  } else {
+    let md = `# SEO Audit Report\n\n**Date:** ${ts}\n**Pages Audited:** ${audits.length}\n**Average Score:** ${avg}/100\n\n---\n\n`;
+    for (const a of audits) {
+      md += `## ${a.url}\n\n**Score:** ${a.score}/100\n\n`;
+      if (a.checks.length === 0) {
+        md += "No checks performed.\n\n";
+      } else {
+        md += "| Status | Check | Message |\n|--------|-------|---------|\n";
+        for (const c of a.checks) {
+          md += `| ${c.status.toUpperCase()} | ${c.name} | ${c.message} |\n`;
+        }
+        md += "\n";
+      }
+    }
+    downloadBlob(md, `seo-audit-${ts}.md`, "text/markdown");
+  }
+}
+
+function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
+  return (
+    <span className={`inline-block ml-1 text-[10px] ${active ? "text-[#3bde77]" : "text-muted-foreground/40"}`}>
+      {active ? (dir === "asc" ? "▲" : "▼") : "⇅"}
+    </span>
+  );
+}
+
 export default function Auditor() {
   const [data, setData] = useState<any[] | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [filter, setFilter] = useState<StatusFilter>("all");
+  const [sortKey, setSortKey] = useState<SortKey>("score");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("json");
+  const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
+  const { toast } = useToast();
+
+  const copyUrl = (url: string) => {
+    navigator.clipboard.writeText(url).then(() => {
+      setCopiedUrl(url);
+      toast({ title: "Copied", description: url });
+      setTimeout(() => setCopiedUrl(null), 2000);
+    });
+  };
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir(sortDir === "asc" ? "desc" : "asc");
+    } else {
+      setSortKey(key);
+      setSortDir(key === "url" ? "asc" : "asc");
+    }
+  };
 
   const audits: PageAudit[] = (data || [])
     .filter((p) => p?.url && p?.content)
     .map((p) => auditPage(p.url, p.content));
 
   const avgScore = audits.length ? Math.round(audits.reduce((s, a) => s + a.score, 0) / audits.length) : 0;
+  const failCount = audits.filter((a) => a.checks.some((c) => c.status === "fail")).length;
+  const warnCount = audits.filter((a) => a.checks.some((c) => c.status === "warn") && !a.checks.some((c) => c.status === "fail")).length;
+  const passCount = audits.filter((a) => a.checks.every((c) => c.status === "pass")).length;
+  const totalFails = audits.reduce((s, a) => s + a.checks.filter((c) => c.status === "fail").length, 0);
+  const totalWarns = audits.reduce((s, a) => s + a.checks.filter((c) => c.status === "warn").length, 0);
+
+  // Filter
+  const filteredAudits = filter === "all"
+    ? audits
+    : filter === "fail"
+    ? audits.filter((a) => a.checks.some((c) => c.status === "fail"))
+    : filter === "warn"
+    ? audits.filter((a) => a.checks.some((c) => c.status === "warn"))
+    : audits.filter((a) => a.checks.every((c) => c.status === "pass"));
+
+  // Sort
+  const sortedAudits = [...filteredAudits].sort((a, b) => {
+    let cmp = 0;
+    if (sortKey === "score") cmp = a.score - b.score;
+    else if (sortKey === "url") cmp = a.url.localeCompare(b.url);
+    else cmp = a.checks.filter((c) => c.status === "fail").length - b.checks.filter((c) => c.status === "fail").length;
+    return sortDir === "asc" ? cmp : -cmp;
+  });
+
+  const filterCounts: Record<StatusFilter, number> = {
+    all: audits.length,
+    fail: failCount,
+    warn: warnCount,
+    pass: passCount,
+  };
 
   return (
     <div className="flex flex-col h-screen">
       <SearchBar setDataValues={setData} />
-      <div className="flex-1 overflow-auto p-4">
-        {audits.length > 0 && (
+      <div className="flex-1 overflow-auto p-4 max-w-5xl mx-auto w-full">
+        {audits.length > 0 ? (
           <>
-            <div className="flex items-center gap-6 mb-6">
-              <div className={`w-20 h-20 rounded-full flex items-center justify-center text-2xl font-bold border-4 ${avgScore >= 80 ? "border-green-500 text-green-500" : avgScore >= 50 ? "border-yellow-500 text-yellow-500" : "border-red-500 text-red-500"}`}>
-                {avgScore}
+            {/* Stats Dashboard */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
+              <div className={`border rounded-lg p-4 text-center ${scoreBg(avgScore)}`}>
+                <div className={`w-16 h-16 rounded-full flex items-center justify-center text-2xl font-bold border-4 mx-auto ${scoreBorder(avgScore)} ${scoreColor(avgScore)}`}>
+                  {avgScore}
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">Avg Score</p>
               </div>
-              <div>
-                <h2 className="text-xl font-bold">Overall SEO Score</h2>
-                <p className="text-muted-foreground">{audits.length} pages audited</p>
+              <div className="border rounded-lg p-4 text-center">
+                <p className="text-2xl font-bold">{audits.length}</p>
+                <p className="text-xs text-muted-foreground mt-1">Pages Audited</p>
+              </div>
+              <div className="border rounded-lg p-4 text-center bg-red-500/10 border-red-500/20">
+                <p className="text-2xl font-bold text-red-400">{totalFails}</p>
+                <p className="text-xs text-muted-foreground mt-1">Fails</p>
+              </div>
+              <div className="border rounded-lg p-4 text-center bg-yellow-500/10 border-yellow-500/20">
+                <p className="text-2xl font-bold text-yellow-400">{totalWarns}</p>
+                <p className="text-xs text-muted-foreground mt-1">Warnings</p>
+              </div>
+              <div className="border rounded-lg p-4 text-center bg-green-500/10 border-green-500/20">
+                <p className="text-2xl font-bold text-green-400">{passCount}</p>
+                <p className="text-xs text-muted-foreground mt-1">All Pass</p>
               </div>
             </div>
-            <div className="border rounded-lg overflow-hidden">
-              {audits.map((audit) => (
-                <div key={audit.url} className="border-b last:border-b-0">
-                  <button className="w-full flex items-center gap-3 p-3 hover:bg-muted/50 text-left" onClick={() => setExpanded(expanded === audit.url ? null : audit.url)}>
-                    <span className={`text-sm font-bold ${audit.score >= 80 ? "text-green-500" : audit.score >= 50 ? "text-yellow-500" : "text-red-500"}`}>{audit.score}</span>
-                    <span className="flex-1 truncate text-sm">{audit.url}</span>
-                    <span className="text-xs text-muted-foreground">{audit.checks.filter((c) => c.status === "fail").length} issues</span>
-                  </button>
-                  {expanded === audit.url && (
-                    <div className="px-6 pb-3 space-y-2">
-                      {audit.checks.map((check, i) => (
-                        <div key={i} className="flex items-center gap-2 text-sm">
-                          <Badge variant={check.status === "pass" ? "default" : check.status === "warn" ? "secondary" : "destructive"} className="w-12 justify-center text-xs">
-                            {check.status}
-                          </Badge>
-                          <span className="font-medium w-32">{check.name}</span>
-                          <span className="text-muted-foreground">{check.message}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
+
+            {/* Result Banner */}
+            {totalFails === 0 && totalWarns === 0 ? (
+              <div className="rounded-lg border border-green-500/30 bg-green-500/10 p-4 mb-6 text-center">
+                <p className="text-green-400 font-semibold text-lg">All pages pass SEO checks!</p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  No issues found across {audits.length} pages. Your SEO looks great.
+                </p>
+              </div>
+            ) : totalFails > 0 ? (
+              <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 mb-6 text-center">
+                <p className="text-red-400 font-semibold text-lg">
+                  {totalFails} fail{totalFails !== 1 ? "s" : ""} and {totalWarns} warning{totalWarns !== 1 ? "s" : ""} found
+                </p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Expand each page below to see issues and recommendations.
+                </p>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4 mb-6 text-center">
+                <p className="text-yellow-400 font-semibold text-lg">
+                  {totalWarns} warning{totalWarns !== 1 ? "s" : ""} found
+                </p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  No critical fails, but some improvements are recommended.
+                </p>
+              </div>
+            )}
+
+            {/* Download Controls */}
+            <div className="flex items-center gap-2 mb-4">
+              <Select value={exportFormat} onValueChange={(v) => setExportFormat(v as ExportFormat)}>
+                <SelectTrigger className="w-[130px] h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="json">JSON</SelectItem>
+                  <SelectItem value="csv">CSV</SelectItem>
+                  <SelectItem value="markdown">Markdown</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button size="sm" variant="outline" className="text-xs h-8" onClick={() => exportAudits(audits, exportFormat)}>
+                Download All ({audits.length})
+              </Button>
+              {filter !== "all" && sortedAudits.length > 0 && (
+                <Button size="sm" variant="outline" className="text-xs h-8" onClick={() => exportAudits(sortedAudits, exportFormat)}>
+                  Download Filtered ({sortedAudits.length})
+                </Button>
+              )}
+            </div>
+
+            {/* Filter Tabs */}
+            <div className="flex gap-2 mb-4 flex-wrap">
+              {([
+                ["all", "All"],
+                ["fail", "Fails"],
+                ["warn", "Warnings"],
+                ["pass", "Passing"],
+              ] as [StatusFilter, string][]).map(([key, label]) => (
+                <Button
+                  key={key}
+                  size="sm"
+                  variant={filter === key ? "default" : "outline"}
+                  onClick={() => setFilter(key)}
+                  className="text-xs"
+                >
+                  {label} ({filterCounts[key]})
+                </Button>
               ))}
             </div>
+
+            {/* Page List */}
+            {sortedAudits.length === 0 ? (
+              <div className="border rounded-lg p-8 text-center text-muted-foreground">
+                No pages match the current filter.
+              </div>
+            ) : (
+              <div className="border rounded-lg overflow-hidden">
+                {/* Table Header */}
+                <div className="flex items-center gap-3 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b">
+                  <button className="w-12 text-center hover:text-foreground transition-colors" onClick={() => toggleSort("score")}>
+                    Score<SortIcon active={sortKey === "score"} dir={sortDir} />
+                  </button>
+                  <button className="flex-1 text-left hover:text-foreground transition-colors" onClick={() => toggleSort("url")}>
+                    Page URL<SortIcon active={sortKey === "url"} dir={sortDir} />
+                  </button>
+                  <button className="w-32 text-center hidden sm:block hover:text-foreground transition-colors" onClick={() => toggleSort("issues")}>
+                    Issues<SortIcon active={sortKey === "issues"} dir={sortDir} />
+                  </button>
+                  <span className="w-6"></span>
+                </div>
+                {sortedAudits.map((audit) => {
+                  const isExpanded = expanded === audit.url;
+                  const pageFails = audit.checks.filter((c) => c.status === "fail").length;
+                  const pageWarns = audit.checks.filter((c) => c.status === "warn").length;
+                  return (
+                    <div key={audit.url} className="border-b last:border-b-0">
+                      <div
+                        className="flex items-center gap-3 px-3 py-2.5 hover:bg-muted/30 transition-colors cursor-pointer"
+                        onClick={() => setExpanded(isExpanded ? null : audit.url)}
+                      >
+                        <span className={`text-sm font-bold w-12 text-center ${scoreColor(audit.score)}`}>{audit.score}</span>
+                        <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                          <a
+                            href={audit.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="truncate font-mono text-xs hover:text-primary hover:underline"
+                            title={audit.url}
+                          >
+                            {audit.url}
+                          </a>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); copyUrl(audit.url); }}
+                            className="shrink-0 p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                            title="Copy URL"
+                          >
+                            {copiedUrl === audit.url ? (
+                              <svg className="w-3.5 h-3.5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                            ) : (
+                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
+                            )}
+                          </button>
+                        </div>
+                        <div className="w-32 hidden sm:flex gap-1.5 justify-center shrink-0">
+                          {pageFails > 0 && (
+                            <Badge variant="destructive" className="text-[10px]">
+                              {pageFails} {pageFails === 1 ? "fail" : "fails"}
+                            </Badge>
+                          )}
+                          {pageWarns > 0 && (
+                            <Badge variant="secondary" className="text-[10px]">
+                              {pageWarns} {pageWarns === 1 ? "warn" : "warns"}
+                            </Badge>
+                          )}
+                          {pageFails === 0 && pageWarns === 0 && (
+                            <Badge variant="outline" className="text-[10px] text-green-400 border-green-500/30">
+                              Pass
+                            </Badge>
+                          )}
+                        </div>
+                        <span className="text-muted-foreground text-xs w-6 text-center shrink-0">{isExpanded ? "▲" : "▼"}</span>
+                      </div>
+                      {isExpanded && (
+                        <div className="px-4 pb-4 pt-1 space-y-2 bg-muted/10">
+                          {audit.checks.map((check, i) => (
+                            <div key={i} className="border rounded-lg p-3 text-sm bg-background">
+                              <div className="flex items-center gap-2 mb-1">
+                                <Badge
+                                  variant={check.status === "fail" ? "destructive" : check.status === "warn" ? "secondary" : "default"}
+                                  className="text-[10px]"
+                                >
+                                  {check.status.toUpperCase()}
+                                </Badge>
+                                <span className="font-medium">{check.name}</span>
+                              </div>
+                              <p className="text-muted-foreground text-xs">{check.message}</p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </>
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
+            <svg
+              height={64}
+              width={64}
+              viewBox="0 0 36 34"
+              xmlSpace="preserve"
+              xmlns="http://www.w3.org/2000/svg"
+              className="fill-[#3bde77] opacity-30"
+            >
+              <path
+                fillRule="evenodd"
+                clipRule="evenodd"
+                d="M9.13883 7.06589V0.164429L13.0938 0.164429V6.175L14.5178 7.4346C15.577 6.68656 16.7337 6.27495 17.945 6.27495C19.1731 6.27495 20.3451 6.69807 21.4163 7.46593L22.8757 6.175V0.164429L26.8307 0.164429V7.06589V7.95679L26.1634 8.54706L24.0775 10.3922C24.3436 10.8108 24.5958 11.2563 24.8327 11.7262L26.0467 11.4215L28.6971 8.08749L31.793 10.5487L28.7257 14.407L28.3089 14.9313L27.6592 15.0944L26.2418 15.4502C26.3124 15.7082 26.3793 15.9701 26.4422 16.2355L28.653 16.6566L29.092 16.7402L29.4524 17.0045L35.3849 21.355L33.0461 24.5444L27.474 20.4581L27.0719 20.3816C27.1214 21.0613 27.147 21.7543 27.147 22.4577C27.147 22.5398 27.1466 22.6214 27.1459 22.7024L29.5889 23.7911L30.3219 24.1177L30.62 24.8629L33.6873 32.5312L30.0152 34L27.246 27.0769L26.7298 26.8469C25.5612 32.2432 22.0701 33.8808 17.945 33.8808C13.8382 33.8808 10.3598 32.2577 9.17593 26.9185L8.82034 27.0769L6.05109 34L2.37897 32.5312L5.44629 24.8629L5.74435 24.1177L6.47743 23.7911L8.74487 22.7806C8.74366 22.6739 8.74305 22.5663 8.74305 22.4577C8.74305 21.7616 8.76804 21.0758 8.81654 20.4028L8.52606 20.4581L2.95395 24.5444L0.615112 21.355L6.54761 17.0045L6.908 16.7402L7.34701 16.6566L9.44264 16.2575C9.50917 15.9756 9.5801 15.6978 9.65528 15.4242L8.34123 15.0944L7.69155 14.9313L7.27471 14.407L4.20739 10.5487L7.30328 8.08749L9.95376 11.4215L11.0697 11.7016C11.3115 11.2239 11.5692 10.7716 11.8412 10.3473L9.80612 8.54706L9.13883 7.95679V7.06589Z"
+              ></path>
+            </svg>
+            <h2 className="text-xl font-semibold text-muted-foreground">
+              Spider SEO Auditor
+            </h2>
+            <p className="text-sm text-muted-foreground max-w-md">
+              Enter a website URL above to crawl and audit for SEO issues.
+              Spider will check for title tags, meta descriptions, heading structure,
+              image alt text, and Open Graph tags.
+            </p>
+          </div>
         )}
-        {!data && <div className="flex items-center justify-center h-full text-muted-foreground">Enter a URL to audit SEO</div>}
       </div>
     </div>
   );
